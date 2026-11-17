@@ -30,6 +30,15 @@ const UPLOAD_RESULT = 'application/x-git-upload-pack-result';
 const RECEIVE_AD = 'application/x-git-receive-pack-advertisement';
 const RECEIVE_RESULT = 'application/x-git-receive-pack-result';
 
+/**
+ * Cache of computed fetch pack bodies, keyed by (repo version, args). The upload-pack response is
+ * fully determined by the repo's object store at a given `repo.version` plus the fetch arguments
+ * (wants/haves/shallow/depth); a depth-1 clone of a stable repo therefore computes the pack once and
+ * every concurrent clone reuses the exact same bytes. The per-request X-GitHub-Request-Id header is
+ * applied at send time, not cached. The repo.version bump on every mutation keeps the cache honest.
+ */
+const fetchCache = new Map<string, [string[], string[], Buffer[]]>();
+
 /** Send a raw (non-JSON) body with the request id. */
 function sendRaw(ctx: Ctx, status: number, contentType: string, body: Buffer): void {
   ctx.res.writeHead(status, {
@@ -338,9 +347,38 @@ function sidebandPack(pack: Buffer): Buffer[] {
   return chunks;
 }
 
-function fetchV2(ctx: Ctx, repo: Repo, args: FetchArgs): boolean {
+/** The cacheable outcome of one fetch: the sideband pack chunks plus the shallow boundary lists. */
+interface FetchResult {
+  readonly shallow: string[];
+  readonly unshallow: string[];
+  readonly packChunks: Buffer[];
+}
+
+/** The fetch cache key: the repo's immutable version plus a compact signature of the args. */
+function fetchCacheKey(repo: Repo, args: FetchArgs): string {
+  const wants = args.wants.sort().join('');
+  const haves = args.haves.sort().join('');
+  const shallows = args.shallow.sort().join('');
+  return `${repo.id}:${repo.version}:${wants}:${haves}:${shallows}:${args.depth}`;
+}
+
+/**
+ * Compute (or reuse) the upload-pack fetch response. The pack and shallow boundary depend only on the
+ * repo's object store at this `repo.version` and the fetch arguments, so repeated/cloned fetches of a
+ * stable repo share one computation. The per-request id header is applied outside this cache.
+ */
+function cachedFetch(repo: Repo, args: FetchArgs): FetchResult {
+  const key = fetchCacheKey(repo, args);
+  const hit = fetchCache.get(key);
+  if (hit !== undefined) return { shallow: hit[0], unshallow: hit[1], packChunks: hit[2] };
   const { objects, shallow, unshallow } = selectFetch(repo, args);
-  const pack = writePack(objects.values());
+  const packChunks = sidebandPack(writePack(objects.values()));
+  fetchCache.set(key, [shallow, unshallow, packChunks]);
+  return { shallow, unshallow, packChunks };
+}
+
+function fetchV2(ctx: Ctx, repo: Repo, args: FetchArgs): boolean {
+  const { shallow, unshallow, packChunks } = cachedFetch(repo, args);
   const parts: Buffer[] = [];
   if (args.haves.length > 0) {
     parts.push(encodePktLines(['acknowledgments\n', 'NAK\n', 'flush']));
@@ -353,7 +391,7 @@ function fetchV2(ctx: Ctx, repo: Repo, args: FetchArgs): boolean {
     parts.push(encodePktLines(lines));
   }
   parts.push(encodePktLine('packfile\n'));
-  parts.push(...sidebandPack(pack));
+  parts.push(...packChunks);
   parts.push(Buffer.from('0000', 'ascii'));
   sendRaw(ctx, 200, UPLOAD_RESULT, Buffer.concat(parts));
   return true;
@@ -402,13 +440,12 @@ function uploadPackV0(ctx: Ctx, repo: Repo, packets: readonly GitPacket[]): bool
     }
     // done: negotiation is over; the pack follows.
   }
-  const { objects, shallow: newShallow, unshallow } = selectFetch(repo, { wants, haves, shallow, depth });
-  const pack = writePack(objects.values());
+  const { shallow: newShallow, unshallow, packChunks } = cachedFetch(repo, { wants, haves, shallow, depth });
   const parts: Buffer[] = [];
   for (const oid of newShallow) parts.push(encodePktLine(`shallow ${oid}\n`));
   for (const oid of unshallow) parts.push(encodePktLine(`unshallow ${oid}\n`));
   parts.push(encodePktLine('NAK\n'));
-  parts.push(...sidebandPack(pack));
+  parts.push(...packChunks);
   parts.push(Buffer.from('0000', 'ascii'));
   sendRaw(ctx, 200, UPLOAD_RESULT, Buffer.concat(parts));
   return true;
@@ -484,9 +521,14 @@ function receivePack(ctx: Ctx, repo: Repo): boolean {
   if (packBytes.length > 0) {
     try {
       const objects = readPack(packBytes, { resolveBase: (oid) => repo.objects.get(oid) });
+      let mutated = false;
       for (const [oid, object] of objects) {
-        if (!repo.objects.has(oid)) repo.objects.set(oid, object);
+        if (!repo.objects.has(oid)) {
+          repo.objects.set(oid, object);
+          mutated = true;
+        }
       }
+      if (mutated) repo.version += 1;
     } catch (err) {
       unpackOk = false;
       unpackDetail = err instanceof Error ? err.message : String(err);
@@ -511,6 +553,7 @@ function receivePack(ctx: Ctx, repo: Repo): boolean {
           continue;
         }
         repo.refs.delete(command.ref);
+        repo.version += 1;
         reportLines.push(`ok ${command.ref}\n`);
         continue;
       }
@@ -519,6 +562,7 @@ function receivePack(ctx: Ctx, repo: Repo): boolean {
         continue;
       }
       repo.refs.set(command.ref, command.newOid);
+      repo.version += 1;
       reportLines.push(`ok ${command.ref}\n`);
     }
   } else {

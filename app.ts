@@ -52,7 +52,10 @@ export function createApp(): Server {
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       const { pathname, query } = pathOf(req);
-      const body = await readBody(req);
+      // GET/HEAD never carry a body: skip the read (a wasted stream-drain on every listing)
+      // and hand handlers an empty buffer. Only body-bearing verbs pay the read cost.
+      const body =
+        req.method === 'GET' || req.method === 'HEAD' ? Buffer.alloc(0) : await readBody(req);
       const ctx: Ctx = makeCtx(req, res, pathname, query, store, token, body ?? Buffer.alloc(0));
       try {
         if (body === null) {

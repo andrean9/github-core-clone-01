@@ -66,6 +66,12 @@ function labelShape(label: Label): Record<string, unknown> {
   return { id: label.id, name: label.name, color: label.color, description: '', default: false };
 }
 
+// The issue author is always the single viewer account, so it is constant across every issue: build
+// it once and reuse the object instead of allocating a fresh shape on each serialization. The labels
+// of a label-less issue are likewise an empty list that needs no fresh allocation.
+const ISSUE_VIEWER = userShape(VIEWER.login, VIEWER.id);
+const EMPTY_LABELS: Record<string, unknown>[] = [];
+
 function issueShape(issue: Issue): Record<string, unknown> {
   return {
     id: issue.id,
@@ -73,8 +79,8 @@ function issueShape(issue: Issue): Record<string, unknown> {
     title: issue.title,
     body: issue.body,
     state: issue.state,
-    labels: issue.labels.map(labelShape),
-    user: userShape(VIEWER.login, VIEWER.id),
+    labels: issue.labels.length === 0 ? EMPTY_LABELS : issue.labels.map(labelShape),
+    user: ISSUE_VIEWER,
     created_at: issue.createdAt,
     updated_at: issue.updatedAt,
     comments: issue.comments.length,

@@ -91,6 +91,8 @@ export interface Repo {
   readonly issues: Map<number, Issue>;
   readonly pulls: Map<number, PullRequest>;
   nextNumber: number;
+  /** Bumped on every object/ref mutation so derived caches (packfile) key on it. */
+  version: number;
 }
 
 export class ForgeStore {
@@ -151,6 +153,7 @@ export class ForgeStore {
       issues: new Map(),
       pulls: new Map(),
       nextNumber: 1,
+      version: 0,
     };
     this.repos.set(repo.fullName, repo);
     return repo;
